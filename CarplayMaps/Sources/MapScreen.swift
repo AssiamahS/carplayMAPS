@@ -1,6 +1,7 @@
 import SwiftUI
 import MapKit
 import CoreLocation
+import AVFoundation
 
 struct MapScreen: View {
     @State private var model = RouteModel()
@@ -13,18 +14,30 @@ struct MapScreen: View {
         ZStack(alignment: .top) {
             map
             VStack(spacing: 10) {
-                searchBar
-                if !model.results.isEmpty && searchFocused {
-                    resultsList
+                if model.isGuiding {
+                    guidanceBanner
+                } else {
+                    searchBar
+                    if !model.results.isEmpty && searchFocused {
+                        resultsList
+                    }
                 }
                 Spacer()
                 if let route = model.route {
-                    etaCard(route)
+                    bottomCard(route)
                 }
             }
             .padding()
         }
         .onAppear { model.requestLocation() }
+        .onChange(of: query) {
+            model.autocomplete(query)
+        }
+        .onChange(of: model.isGuiding) {
+            camera = model.isGuiding
+                ? .userLocation(followsHeading: true, fallback: .automatic)
+                : .userLocation(fallback: .automatic)
+        }
         .sheet(isPresented: $showSteps) {
             stepsSheet
         }
@@ -55,8 +68,8 @@ struct MapScreen: View {
             TextField("Where to?", text: $query)
                 .focused($searchFocused)
                 .autocorrectionDisabled()
-                .onSubmit { model.search(query) }
-            if model.route != nil || model.destination != nil {
+                .onSubmit { model.searchAndRoute(query) }
+            if model.route != nil || model.destination != nil || !query.isEmpty {
                 Button {
                     query = ""
                     model.clear()
@@ -71,17 +84,17 @@ struct MapScreen: View {
 
     private var resultsList: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(model.results, id: \.self) { item in
+            ForEach(model.results) { result in
                 Button {
                     searchFocused = false
-                    model.route(to: item)
-                    query = item.name ?? query
+                    query = result.title
+                    model.route(toCompletion: result)
                 } label: {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(item.name ?? "Unknown")
+                        Text(result.title)
                             .font(.subheadline.bold())
-                        if let locality = item.placemark.title {
-                            Text(locality)
+                        if !result.subtitle.isEmpty {
+                            Text(result.subtitle)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
@@ -98,7 +111,27 @@ struct MapScreen: View {
         .glassEffect(in: .rect(cornerRadius: 16))
     }
 
-    private func etaCard(_ route: MKRoute) -> some View {
+    private var guidanceBanner: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "arrow.turn.up.right")
+                .font(.system(size: 30, weight: .bold))
+                .foregroundStyle(.white)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(model.currentInstruction)
+                    .font(.system(.title3, design: .rounded).weight(.bold))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                Text(model.distanceToNextManeuver)
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.8))
+            }
+            Spacer()
+        }
+        .padding(16)
+        .background(Color.green.opacity(0.9), in: RoundedRectangle(cornerRadius: 20))
+    }
+
+    private func bottomCard(_ route: MKRoute) -> some View {
         HStack(spacing: 16) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(etaText(route.expectedTravelTime))
@@ -111,11 +144,23 @@ struct MapScreen: View {
             Button {
                 showSteps = true
             } label: {
-                Image(systemName: "list.bullet")
-                    .font(.title3)
+                Image(systemName: "list.bullet").font(.title3)
             }
             .buttonStyle(.bordered)
             .clipShape(Circle())
+            Button {
+                if model.isGuiding {
+                    model.stopGuidance()
+                } else {
+                    model.startGuidance()
+                }
+            } label: {
+                Label(model.isGuiding ? "End" : "Go",
+                      systemImage: model.isGuiding ? "xmark" : "location.north.line.fill")
+                    .font(.headline)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(model.isGuiding ? .red : .green)
         }
         .padding(16)
         .glassEffect(in: .rect(cornerRadius: 20))
@@ -125,11 +170,11 @@ struct MapScreen: View {
         NavigationStack {
             List {
                 if let route = model.route {
-                    ForEach(Array(route.steps.enumerated()), id: \.offset) { _, step in
+                    ForEach(Array(route.steps.enumerated()), id: \.offset) { index, step in
                         if !step.instructions.isEmpty {
                             HStack(alignment: .top, spacing: 12) {
                                 Image(systemName: "arrow.turn.up.right")
-                                    .foregroundStyle(.blue)
+                                    .foregroundStyle(index == model.stepIndex ? .green : .blue)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(step.instructions).font(.subheadline)
                                     Text(distanceText(step.distance))
@@ -148,7 +193,7 @@ struct MapScreen: View {
     }
 
     private func etaText(_ t: TimeInterval) -> String {
-        let mins = Int(t / 60)
+        let mins = max(1, Int(t / 60))
         return mins >= 60 ? "\(mins / 60) hr \(mins % 60) min" : "\(mins) min"
     }
 
@@ -162,36 +207,77 @@ struct MapScreen: View {
     }
 }
 
+struct SearchResult: Identifiable, Hashable {
+    let id = UUID()
+    let title: String
+    let subtitle: String
+}
+
 @Observable
 @MainActor
 final class RouteModel {
-    var results: [MKMapItem] = []
+    var results: [SearchResult] = []
     var destination: MKMapItem?
     var route: MKRoute?
+    var isGuiding = false
+    var stepIndex = 0
+    var currentInstruction = ""
+    var distanceToNextManeuver = ""
 
     private let manager = CLLocationManager()
+    private let speech = AVSpeechSynthesizer()
+    private var searchTask: Task<Void, Never>?
+    private var guidanceTask: Task<Void, Never>?
 
     func requestLocation() {
         manager.requestWhenInUseAuthorization()
         manager.startUpdatingLocation()
     }
 
-    func search(_ text: String) {
+    // MARK: search — live as you type (debounced), no focus-out needed
+
+    func autocomplete(_ text: String) {
+        searchTask?.cancel()
         let trimmed = text.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return }
-        let request = MKLocalSearch.Request()
-        request.naturalLanguageQuery = trimmed
-        if let loc = manager.location {
-            request.region = MKCoordinateRegion(center: loc.coordinate,
-                                                latitudinalMeters: 40_000, longitudinalMeters: 40_000)
+        guard trimmed.count >= 3 else {
+            results = []
+            return
         }
-        Task {
+        searchTask = Task {
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            let request = MKLocalSearch.Request()
+            request.naturalLanguageQuery = trimmed
+            if let loc = manager.location {
+                request.region = MKCoordinateRegion(center: loc.coordinate,
+                                                    latitudinalMeters: 60_000, longitudinalMeters: 60_000)
+            }
             let response = try? await MKLocalSearch(request: request).start()
-            self.results = Array((response?.mapItems ?? []).prefix(6))
+            guard !Task.isCancelled else { return }
+            self.lastItems = response?.mapItems ?? []
+            self.results = self.lastItems.prefix(6).map {
+                SearchResult(title: $0.name ?? "Unknown", subtitle: $0.placemark.title ?? "")
+            }
         }
     }
 
-    func route(to item: MKMapItem) {
+    private var lastItems: [MKMapItem] = []
+
+    func searchAndRoute(_ text: String) {
+        if let first = lastItems.first {
+            routeTo(first)
+        } else {
+            autocomplete(text)
+        }
+    }
+
+    func route(toCompletion result: SearchResult) {
+        if let index = results.firstIndex(of: result), index < lastItems.count {
+            routeTo(lastItems[index])
+        }
+    }
+
+    private func routeTo(_ item: MKMapItem) {
         destination = item
         results = []
         let request = MKDirections.Request()
@@ -204,9 +290,91 @@ final class RouteModel {
         }
     }
 
+    // MARK: guidance — follow-me camera, auto-advancing steps, voice
+
+    func startGuidance() {
+        guard let route else { return }
+        isGuiding = true
+        stepIndex = firstRealStep(route)
+        announceCurrentStep()
+        guidanceTask = Task {
+            do {
+                for try await update in CLLocationUpdate.liveUpdates(.automotiveNavigation) {
+                    guard !Task.isCancelled, self.isGuiding else { break }
+                    guard let location = update.location else { continue }
+                    self.tick(location)
+                }
+            } catch {
+                // location stream ended; guidance banner stays on last instruction
+            }
+        }
+    }
+
+    func stopGuidance() {
+        isGuiding = false
+        guidanceTask?.cancel()
+        speech.stopSpeaking(at: .immediate)
+    }
+
+    private func firstRealStep(_ route: MKRoute) -> Int {
+        route.steps.firstIndex { !$0.instructions.isEmpty } ?? 0
+    }
+
+    private func tick(_ location: CLLocation) {
+        guard let route, stepIndex < route.steps.count else { return }
+        let step = route.steps[stepIndex]
+        let end = maneuverPoint(of: step)
+        let distance = location.distance(from: CLLocation(latitude: end.latitude, longitude: end.longitude))
+        distanceToNextManeuver = distance < 322
+            ? "\(Int(distance * 3.28084 / 10) * 10) ft"
+            : String(format: "%.1f mi", distance / 1609.34)
+        if distance < 30 {
+            advanceStep()
+        }
+    }
+
+    private func advanceStep() {
+        guard let route else { return }
+        var next = stepIndex + 1
+        while next < route.steps.count && route.steps[next].instructions.isEmpty {
+            next += 1
+        }
+        if next >= route.steps.count {
+            currentInstruction = "You've arrived"
+            distanceToNextManeuver = ""
+            speak("You have arrived")
+            stopGuidance()
+            return
+        }
+        stepIndex = next
+        announceCurrentStep()
+    }
+
+    private func announceCurrentStep() {
+        guard let route, stepIndex < route.steps.count else { return }
+        currentInstruction = route.steps[stepIndex].instructions
+        speak(currentInstruction)
+    }
+
+    private func speak(_ text: String) {
+        guard !text.isEmpty else { return }
+        speech.speak(AVSpeechUtterance(string: text))
+    }
+
+    private func maneuverPoint(of step: MKRoute.Step) -> CLLocationCoordinate2D {
+        let polyline = step.polyline
+        guard polyline.pointCount > 0 else { return CLLocationCoordinate2D() }
+        return polyline.points()[polyline.pointCount - 1].coordinate
+    }
+
     func clear() {
+        stopGuidance()
         results = []
+        lastItems = []
         destination = nil
         route = nil
+        stepIndex = 0
+        currentInstruction = ""
+        distanceToNextManeuver = ""
     }
 }

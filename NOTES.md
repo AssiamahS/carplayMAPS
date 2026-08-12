@@ -1,0 +1,1 @@
+- carplay-maps entitlement (developer.apple.com/contact/carplay) is the only gate to the car screen; MapKit app itself needs nothing special.
