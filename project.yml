@@ -8,7 +8,7 @@ settings:
   base:
     SWIFT_VERSION: "6.0"
     DEVELOPMENT_TEAM: QGMAWHX827
-    MARKETING_VERSION: 1.0.2
+    MARKETING_VERSION: 1.0.3
     CURRENT_PROJECT_VERSION: 1
 targets:
   CarplayMaps:
@@ -16,6 +16,8 @@ targets:
     platform: iOS
     sources:
       - path: CarplayMaps
+    dependencies:
+      - target: MapsWidget
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: com.djsly.carplaymaps
       CODE_SIGN_STYLE: Automatic
@@ -34,6 +36,27 @@ targets:
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
         NSLocationWhenInUseUsageDescription: Your position drives the map, routing, and ETA.
+        NSSupportsLiveActivities: true
+  MapsWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: MapsWidget
+      - path: CarplayMaps/Shared
+    info:
+      path: MapsWidget/Info.plist
+      properties:
+        CFBundleName: MapsWidget
+        CFBundleDisplayName: carplaymaps
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSSupportsLiveActivities: true
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.djsly.carplaymaps.widgets
+        SKIP_INSTALL: true
 schemes:
   CarplayMaps:
     build:

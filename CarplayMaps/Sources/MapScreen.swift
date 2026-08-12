@@ -2,6 +2,12 @@ import SwiftUI
 import MapKit
 import CoreLocation
 import AVFoundation
+import ActivityKit
+
+/// Guidance activity handle crossing into detached tasks; ActivityKit is safe for this use.
+final class GuidanceActivityBox: @unchecked Sendable {
+    var activity: Activity<GuidanceAttributes>?
+}
 
 struct MapScreen: View {
     @State private var model = RouteModel()
@@ -228,6 +234,7 @@ final class RouteModel {
     private let speech = AVSpeechSynthesizer()
     private var searchTask: Task<Void, Never>?
     private var guidanceTask: Task<Void, Never>?
+    private let activityBox = GuidanceActivityBox()
 
     func requestLocation() {
         manager.requestWhenInUseAuthorization()
@@ -314,6 +321,36 @@ final class RouteModel {
         isGuiding = false
         guidanceTask?.cancel()
         speech.stopSpeaking(at: .immediate)
+        let box = activityBox
+        Task.detached {
+            if let running = box.activity {
+                box.activity = nil
+                await running.end(nil, dismissalPolicy: .immediate)
+            }
+        }
+    }
+
+    private func updateGuidanceActivity() {
+        guard isGuiding else { return }
+        let eta = route.map { arrivalShort($0.expectedTravelTime) } ?? ""
+        let state = GuidanceAttributes.ContentState(
+            instruction: currentInstruction,
+            distance: distanceToNextManeuver,
+            eta: eta)
+        let content = ActivityContent(state: state, staleDate: Date().addingTimeInterval(120))
+        let attributes = GuidanceAttributes(destination: destination?.name ?? "Destination")
+        let box = activityBox
+        Task.detached {
+            if let activity = box.activity {
+                await activity.update(content)
+            } else {
+                box.activity = try? Activity.request(attributes: attributes, content: content)
+            }
+        }
+    }
+
+    private func arrivalShort(_ t: TimeInterval) -> String {
+        Date.now.addingTimeInterval(t).formatted(date: .omitted, time: .shortened)
     }
 
     private func firstRealStep(_ route: MKRoute) -> Int {
@@ -325,9 +362,13 @@ final class RouteModel {
         let step = route.steps[stepIndex]
         let end = maneuverPoint(of: step)
         let distance = location.distance(from: CLLocation(latitude: end.latitude, longitude: end.longitude))
-        distanceToNextManeuver = distance < 322
+        let label = distance < 322
             ? "\(Int(distance * 3.28084 / 10) * 10) ft"
             : String(format: "%.1f mi", distance / 1609.34)
+        if label != distanceToNextManeuver {
+            distanceToNextManeuver = label
+            updateGuidanceActivity()
+        }
         if distance < 30 {
             advanceStep()
         }
@@ -354,6 +395,7 @@ final class RouteModel {
         guard let route, stepIndex < route.steps.count else { return }
         currentInstruction = route.steps[stepIndex].instructions
         speak(currentInstruction)
+        updateGuidanceActivity()
     }
 
     private func speak(_ text: String) {
